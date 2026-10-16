@@ -1,0 +1,77 @@
+{
+  "id": "com.winplayer.bilibili",
+  "name": "哔哩哔哩",
+  "version": "1.0.0",
+  "description": "哔哩哔哩音源。把 B 站视频当作歌曲播放：通过公开 Web 接口提供视频搜索、DASH 音频直链（64K/132K/192K）、UP 主（歌手）与视频合集（专辑）、热门推荐、字幕转歌词、热搜词、扫码登录、头像与个人收藏夹同步（收藏/取消收藏视频）。B 站没有公开的歌单搜索接口，「歌单」对应 B 站收藏夹，登录后在侧边栏「平台歌单」中使用。",
+  "author": "WinPlayer",
+  "homepage": "https://www.bilibili.com",
+  "main": "main.js",
+  "apiVersion": 1,
+  "capabilities": [
+    "search",
+    "songUrl",
+    "playlist",
+    "album",
+    "artist",
+    "recommend",
+    "lyrics",
+    "hotKeywords",
+    "login",
+    "avatar",
+    "myPlaylists"
+  ],
+  "login": {
+    "credentialKey": "cookie",
+    "pollInterval": 2000,
+    "expiresIn": 180000
+  },
+  "settings": [
+    {
+      "key": "quality",
+      "label": "播放音质",
+      "type": "select",
+      "default": "exhigh",
+      "options": [
+        { "label": "标准（64K AAC）", "value": "standard" },
+        { "label": "较高（132K AAC）", "value": "higher" },
+        { "label": "高品（192K AAC）", "value": "exhigh" }
+      ],
+      "description": "B 站 DASH 音轨的三档码率；实际可用档位受稿件限制，取不到时会自动降级"
+    },
+    {
+      "key": "cookie",
+      "label": "登录 Cookie",
+      "type": "password",
+      "placeholder": "SESSDATA=xxx; bili_jct=xxx; DedeUserID=xxx",
+      "description": "推荐在插件页直接扫码登录；也可在浏览器登录 bilibili.com 后，从 DevTools → Application → Cookies 复制 SESSDATA、bili_jct、DedeUserID、buvid3 等条目按「名称=值」用分号连接粘贴到这里"
+    },
+    {
+      "key": "pageSize",
+      "label": "单次返回数量",
+      "type": "number",
+      "default": 20,
+      "description": "热门推荐单次返回的视频数（1-50）。B 站搜索固定每页 20 条，不受此项影响"
+    },
+    {
+      "key": "maxTracks",
+      "label": "歌单曲目上限",
+      "type": "number",
+      "default": 200,
+      "description": "单个收藏夹 / 合集最多加载的视频数，0 表示不限制；收藏夹接口每页仅 20 条，超大收藏夹会明显变慢"
+    },
+    {
+      "key": "platformPlaylists",
+      "label": "平台歌单（收藏夹同步）",
+      "type": "switch",
+      "default": true,
+      "description": "开启后在「平台歌单」中显示 B 站收藏夹（可浏览、把视频收藏进/移出收藏夹）；关闭后本插件不再返回平台歌单，「加入歌单」选择器里也不再出现哔哩哔哩分组。仅影响本音源，不影响扫码登录、字幕歌词等其他功能"
+    },
+    {
+      "key": "apiHost",
+      "label": "接口地址",
+      "type": "text",
+      "default": "https://api.bilibili.com",
+      "description": "B 站 Web 接口域名，可替换为兼容路径的自建反向代理（登录接口固定走 passport.bilibili.com）"
+    }
+  ]
+}
