@@ -1,7 +1,7 @@
 {
   "id": "com.winplayer.bilibili",
   "name": "哔哩哔哩",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "哔哩哔哩音源。把 B 站视频当作歌曲播放：通过公开 Web 接口提供视频搜索、DASH 音频直链（64K/132K/192K）、UP 主（歌手）与视频合集（专辑）、热门推荐、字幕转歌词、热搜词、扫码登录、头像与个人收藏夹同步（收藏/取消收藏视频）。B 站没有公开的歌单搜索接口，「歌单」对应 B 站收藏夹，登录后在侧边栏「平台歌单」中使用。",
   "author": "WinPlayer",
   "homepage": "https://www.bilibili.com",

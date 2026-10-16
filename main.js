@@ -644,11 +644,11 @@ async function fetchView({ bvid, aid }) {
   return data;
 }
 
-/** playurl（fnval=16 取 DASH，fnval=1 退回 MP4 整流） */
-async function fetchPlayUrl({ bvid, aid, cid, fnval }) {
+/** playurl（fnval=16 取 DASH，fnval=1 退回 MP4 整流，extra 可加 platform=html5 等参数） */
+async function fetchPlayUrl({ bvid, aid, cid, fnval, extra = {} }) {
   return apiGet(
     "/x/player/playurl",
-    { bvid, avid: aid, cid, fnver: 0, fnval, fourk: 0 },
+    { bvid, avid: aid, cid, fnver: 0, fnval, fourk: 0, ...extra },
     { label: "获取播放直链" },
   );
 }
@@ -962,11 +962,48 @@ function pickAudio(list, targetId) {
 }
 
 /**
- * 取播放直链：view（bvid → cid，多 P 按 #pN 取对应分 P）→ playurl 选音轨。
+ * 直链可达性探测：upos 等镜像节点有防盗链（只放行带 bilibili Referer 的请求），
+ * 而 <audio> 元素只会带应用源 Referer → 403 → NotSupportedError。
+ * 用 Range 0-0 探一次（无 Referer 请求的放行结论与应用源 Referer 一致：锁的都拦、不锁的都放），
+ * 被拦就走 MP4 / html5 兜底线路。
+ */
+async function probePlayable(url) {
+  try {
+    const response = await rawRequest({ url, headers: { Range: "bytes=0-0" } });
+    const host = (() => {
+      try {
+        return new URL(url).host;
+      } catch {
+        return "?";
+      }
+    })();
+    debugLog(`探测 ${host} → HTTP ${response.status}${response.status >= 200 && response.status < 300 ? "（可达）" : "（被拦/不可达）"}`);
+    return response.status >= 200 && response.status < 300;
+  } catch (error) {
+    debugLog(`探测失败：${error?.message ?? error}`);
+    return false;
+  }
+}
+
+/** 从 durl 对象收集全部候选地址（主地址 + 备用地址），统一 https 化 */
+function durlCandidates(durl) {
+  if (!durl) return [];
+  const backups = [...(Array.isArray(durl.backup_url) ? durl.backup_url : []), ...(Array.isArray(durl.backupUrl) ? durl.backupUrl : [])];
+  return [durl.url, ...backups].map(httpsify).filter(Boolean);
+}
+
+/**
+ * 取播放直链：view（bvid → cid，多 P 按 #pN 取对应分 P）→ playurl 选音轨 → 探测可达性。
  * 直链约 120 分钟过期，宿主每次播放都会重新调用，不做长期缓存。
+ * 防盗链处理：upos 等镜像节点只放行 bilibili Referer，浏览器里 <audio> 会 403，
+ * 因此对直链先探测，被拦时自动降级 MP4 整流 / platform=html5 线路（节点不锁 Referer）。
  */
 async function getSongUrl(params = {}) {
   const { bvid, aid, page } = parseTrackId(params.id);
+  const qualityKey = String(params.quality || readSetting("quality", "exhigh"));
+  const targetId = resolveTargetQuality(qualityKey);
+  debugLog(`取直链：id=${params.id} → bvid=${bvid ?? "-"} aid=${aid ?? "-"} 分P=${page}，音质=${qualityKey}（档位 ${targetId}）`);
+
   const view = await fetchView({ bvid, aid });
 
   let cid = view.cid;
@@ -978,22 +1015,66 @@ async function getSongUrl(params = {}) {
     }
     cid = part.cid;
   }
+  debugLog(`view：aid=${view.aid} cid=${cid} 标题=${(stripHtml(view.title) || "").slice(0, 40)} 分P数=${Array.isArray(view.pages) && view.pages.length ? view.pages.length : 1}`);
 
-  const targetId = resolveTargetQuality(params.quality);
   const dash = await fetchPlayUrl({ bvid: view.bvid, aid: view.aid, cid, fnval: 16 });
-  const audio = pickAudio(dash?.dash?.audio, targetId);
+  const tracks = Array.isArray(dash?.dash?.audio) ? dash.dash.audio : [];
+  debugLog(
+    `playurl(DASH)：音轨 ${tracks.length} 条 [${tracks.map((a) => `${a.id}/${a.bandwidth ?? "?"}`).join(", ")}] durl=${Array.isArray(dash?.durl) ? dash.durl.length : 0}`,
+  );
+
+  const audio = pickAudio(tracks, targetId);
+  let dashUrl = null;
   if (audio) {
-    return {
-      url: httpsify(audio.baseUrl || audio.base_url),
-      quality: AUDIO_ID_LABELS[Number(audio.id)] ?? "standard",
-      br: audio.bandwidth,
-    };
+    dashUrl = httpsify(audio.baseUrl || audio.base_url);
+    const reachable = await probePlayable(dashUrl);
+    debugLog(
+      `选定音轨 id=${audio.id}（${AUDIO_ID_LABELS[Number(audio.id)] ?? "?"}）带宽=${audio.bandwidth} 探测=${reachable ? "可达" : "被拦（防盗链）"} url=${String(dashUrl).slice(0, 130)}`,
+    );
+    if (reachable) {
+      return { url: dashUrl, quality: AUDIO_ID_LABELS[Number(audio.id)] ?? "standard", br: audio.bandwidth };
+    }
   }
 
-  // DASH 无音轨（个别付费/受限稿件）→ 退回带音轨的 MP4 整流
-  const mp4 = await fetchPlayUrl({ bvid: view.bvid, aid: view.aid, cid, fnval: 1 }).catch(() => null);
-  const durl = mp4?.durl?.[0]?.url;
-  if (durl) return { url: httpsify(durl), quality: "standard" };
+  // 兜底①：MP4 整流（fnval=1，含备用地址逐个探测）
+  const mp4 = await fetchPlayUrl({ bvid: view.bvid, aid: view.aid, cid, fnval: 1 }).catch((error) => {
+    debugLog(`MP4 整流(fnval=1)请求失败：${error?.message ?? error}`);
+    return null;
+  });
+  const mp4Candidates = durlCandidates(mp4?.durl?.[0]);
+  debugLog(`兜底① MP4 整流：候选 ${mp4Candidates.length} 个`);
+  for (const url of mp4Candidates) {
+    if (await probePlayable(url)) {
+      debugLog(`兜底① 可达，采用：${url.slice(0, 130)}`);
+      return { url, quality: "standard" };
+    }
+  }
+
+  // 兜底②：platform=html5 移动端单文件 MP4（该线路节点不锁 Referer）
+  const html5 = await fetchPlayUrl({
+    bvid: view.bvid,
+    aid: view.aid,
+    cid,
+    fnval: 1,
+    extra: { platform: "html5", high_quality: 1 },
+  }).catch((error) => {
+    debugLog(`html5 线路请求失败：${error?.message ?? error}`);
+    return null;
+  });
+  const html5Candidates = durlCandidates(html5?.durl?.[0]);
+  debugLog(`兜底② html5：quality=${html5?.quality ?? "-"} 候选 ${html5Candidates.length} 个`);
+  for (const url of html5Candidates) {
+    if (await probePlayable(url)) {
+      debugLog(`兜底② 可达，采用：${url.slice(0, 130)}`);
+      return { url, quality: "standard" };
+    }
+  }
+
+  // 全部被拦：探测与浏览器环境可能有差异，仍返回 DASH 首选（尽力而为）
+  if (dashUrl) {
+    debugLog("所有线路探测均失败，仍返回 DASH 直链（尽力而为，若播放失败请看上方探测日志）");
+    return { url: dashUrl, quality: AUDIO_ID_LABELS[Number(audio.id)] ?? "standard", br: audio.bandwidth };
+  }
 
   throw new Error(
     `「${stripHtml(view.title) || "该稿件"}」取不到可播放的音频流（可能需要大会员、存在版权或区域限制）`,
