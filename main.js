@@ -1163,7 +1163,7 @@ async function getSongUrl(params = {}) {
   for (const url of mp4Candidates) {
     if (await probePlayable(url)) {
       debugLog(`兜底① 可达，采用：${url.slice(0, 130)}`);
-      return { url, quality: "standard", headers: MEDIA_HEADERS };
+      return { url, quality: "standard", codec: "aac", headers: MEDIA_HEADERS };
     }
   }
 
@@ -1183,7 +1183,7 @@ async function getSongUrl(params = {}) {
   for (const url of html5Candidates) {
     if (await probePlayable(url)) {
       debugLog(`兜底② 可达，采用：${url.slice(0, 130)}`);
-      return { url, quality: "standard", headers: MEDIA_HEADERS };
+      return { url, quality: "standard", codec: "aac", headers: MEDIA_HEADERS };
     }
   }
 
