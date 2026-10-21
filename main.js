@@ -49,7 +49,7 @@ const WBI_KEY_MAX_AGE = 24 * 60 * 60 * 1000; // 密钥每日更替，缓存一�
 const NAV_CACHE_TTL = 60 * 1000; // nav（登录态/头像）缓存 1 分钟，避免频繁请求
 
 const FAV_PAGE_SIZE = 20; // 收藏夹资源列表 ps 定义域 1-20
-const SEASON_PAGE_SIZE = 30; // 合集分页 page_size 定义域 1-30
+const SPACE_PAGE_SIZE = 30; // UP 主投稿分页 ps 定义域 1-50
 const VIEW_CACHE_TTL = 15 * 60 * 1000; // bvid → view（cid/pages）缓存 15 分钟
 const VIEW_CACHE_MAX = 200;
 
@@ -621,19 +621,19 @@ function parseTrackId(id) {
   throw new Error(`无法识别的歌曲 ID「${text}」`);
 }
 
-/** 解析专辑 ID：`s{mid}_{seasonId}` */
-function parseSeasonId(id) {
-  const match = /^s(\d+)_(\d+)$/.exec(String(id ?? "").trim());
-  if (!match) throw new Error(`无法识别的专辑 ID「${id}」（本插件专辑 = B 站视频合集）`);
-  return { mid: match[1], seasonId: match[2] };
-}
-
-/** 关键词切成小写 token，用于专辑名模糊匹配 */
-function keywordTokens(keyword) {
-  return String(keyword)
-    .split(/[\s,，、]+/)
-    .map((token) => token.trim().toLowerCase())
-    .filter(Boolean);
+/**
+ * 解析专辑 ID：专辑 = 一个稿件，所以 ID 就是 `v{bvid}`（也接受裸 `BV...` / `av123`）。
+ * 旧版（1.2.x 及以前）的合集专辑 ID 形如 `s{mid}_{seasonId}`，这里给出可读提示。
+ */
+function parseAlbumId(id) {
+  const text = String(id ?? "").trim();
+  if (!text) throw new Error("缺少专辑 ID");
+  if (/^s\d+_\d+$/.test(text)) {
+    throw new Error("旧版「合集」专辑已不再支持（专辑现在对应单个稿件），请从 UP 主主页重新进入");
+  }
+  const body = /^v(?=BV|av|\d)/i.test(text) ? text.slice(1) : text;
+  const { bvid, aid } = parseTrackId(body);
+  return { bvid, aid };
 }
 
 function formatLrcTime(seconds) {
@@ -683,9 +683,10 @@ async function fetchPlayUrl({ bvid, aid, cid, fnval, extra = {} }) {
 function toTrackFromVideoSearch(item) {
   const bvid = item?.bvid;
   if (!bvid) return null;
+  const name = stripHtml(item.title) || "未知标题";
   const track = {
     id: bvid,
-    name: stripHtml(item.title) || "未知标题",
+    name,
     artists: [item.author || "未知UP主"],
     cover: httpsify(item.pic),
     duration: parseClock(item.duration),
@@ -697,58 +698,43 @@ function toTrackFromVideoSearch(item) {
     },
   };
   if (item.mid) track.artistIds = [String(item.mid)];
-  if (item.typename) track.album = item.typename; // 分区名当纯文本专辑（不可跳转）
+  track.album = name; // 专辑 = 稿件本身（点进去看它的分 P）
+  track.albumId = `v${bvid}`;
   if (item.is_pay || item.badgepay) track.vip = true;
   return track;
 }
 
-function toTrackFromVlist(v, { upName, mid, seasonNames } = {}) {
+function toTrackFromVlist(v, { upName, mid } = {}) {
   if (!v?.bvid) return null;
+  const name = stripHtml(v.title) || "未知标题";
   const track = {
     id: v.bvid,
-    name: stripHtml(v.title) || "未知标题",
+    name,
     artists: [v.author || upName || "未知UP主"],
     cover: httpsify(v.pic),
     duration: parseClock(v.length),
+    album: name, // 专辑 = 稿件本身
+    albumId: `v${v.bvid}`,
     extra: { aid: v.aid, play: v.play ?? 0, created: v.created ?? 0 },
   };
   if (mid) track.artistIds = [String(mid)];
-  const seasonId = v.season_id ? String(v.season_id) : "";
-  if (seasonId && seasonNames?.has(seasonId)) {
-    track.album = seasonNames.get(seasonId);
-    track.albumId = `s${mid}_${seasonId}`; // 指向所在合集
-  }
-  return track;
-}
-
-function toTrackFromArchive(archive, { upName, mid, albumName, albumId } = {}) {
-  if (!archive?.bvid) return null;
-  const track = {
-    id: archive.bvid,
-    name: stripHtml(archive.title) || "未知标题",
-    artists: [archive.author || upName || "未知UP主"],
-    cover: httpsify(archive.pic),
-    duration: parseClock(archive.duration),
-    extra: { aid: archive.aid, pubdate: archive.pubdate ?? 0 },
-  };
-  if (mid) track.artistIds = [String(mid)];
-  if (albumName) track.album = albumName;
-  if (albumId) track.albumId = albumId;
   return track;
 }
 
 function toTrackFromPopular(item) {
   if (!item?.bvid) return null;
+  const name = stripHtml(item.title) || "未知标题";
   const track = {
     id: item.bvid,
-    name: stripHtml(item.title) || "未知标题",
+    name,
     artists: [item.owner?.name || "未知UP主"],
     cover: httpsify(item.pic),
     duration: parseClock(item.duration),
+    album: name, // 专辑 = 稿件本身
+    albumId: `v${item.bvid}`,
     extra: { aid: item.aid, pubdate: item.pubdate ?? 0, tname: item.tname ?? "" },
   };
   if (item.owner?.mid) track.artistIds = [String(item.owner.mid)];
-  if (item.tname) track.album = item.tname;
   return track;
 }
 
@@ -760,13 +746,16 @@ function toTrackFromPopular(item) {
 function toTrackFromFavMedia(media) {
   if (!media || media.type !== 2 || !media.bvid) return null;
   const page = Number(media.page) || 1;
+  const name = stripHtml(media.title) || "未知标题";
   const track = {
     id: page > 1 ? `${media.bvid}#p${page}` : media.bvid,
-    name: stripHtml(media.title) || "未知标题",
+    name,
     artists: [media.upper?.name || "未知UP主"],
     cover: httpsify(media.cover),
     duration: parseClock(media.duration),
-    extra: { avid: media.id, attr: media.attr ?? 0, intro: media.intro ?? "" },
+    album: name, // 专辑 = 该分 P 所在的稿件
+    albumId: `v${media.bvid}`,
+    extra: { avid: media.id, attr: media.attr ?? 0, intro: media.intro ?? "", page },
   };
   if (media.upper?.mid) track.artistIds = [String(media.upper.mid)];
   return track;
@@ -786,33 +775,65 @@ function toPlaylistFromFolder(folder, fallbackId) {
   return playlist;
 }
 
-/** 合集名：去掉「合集·」前缀，meta.title（如「周杰伦」）优先于 meta.name（如「合集·周杰伦」） */
-function cleanSeasonName(meta) {
-  const raw = String(meta?.title || meta?.name || "").trim();
-  return raw.replace(/^合集[·・]\s*/, "") || "未命名合集";
-}
-
-function toAlbumFromSeason(season, upName) {
-  const meta = season?.meta;
-  if (!meta?.season_id) return null;
-  const album = {
-    id: `s${meta.mid}_${meta.season_id}`,
-    name: cleanSeasonName(meta),
-    trackCount:
-      typeof meta.total === "number"
-        ? meta.total
-        : typeof meta.media_count === "number"
-          ? meta.media_count
-          : undefined,
-    artistIds: meta.mid ? [String(meta.mid)] : undefined,
-    artistNames: upName ? [upName] : undefined,
-  };
-  const cover = httpsify(meta.cover);
-  if (cover) album.cover = cover;
-  if (meta.description) album.description = meta.description;
-  const ptime = Number(meta.ptime || meta.pubtime || 0);
+/**
+ * 专辑骨架（专辑 = 一个稿件，ID 统一为 `v{bvid}`）。
+ * 稿件信息可能来自 view / 搜索结果 / 投稿列表，字段名各不相同，这里统一收口。
+ */
+function buildAlbum({ bvid, name, cover, description, artistName, artistId, publishTime, trackCount }) {
+  if (!bvid) return null;
+  const album = { id: `v${bvid}`, name: name || "未知标题" };
+  const img = httpsify(cover);
+  if (img) album.cover = img;
+  if (description) album.description = description;
+  if (typeof trackCount === "number" && trackCount > 0) album.trackCount = trackCount;
+  if (artistName) album.artistNames = [artistName];
+  if (artistId) album.artistIds = [String(artistId)];
+  const ptime = Number(publishTime) || 0;
   if (ptime > 0) album.publishTime = Math.round(ptime * 1000);
   return album;
+}
+
+/** view 响应 → 专辑（分 P 数就是曲目数） */
+function toAlbumFromView(view, trackCount) {
+  if (!view?.bvid) return null;
+  return buildAlbum({
+    bvid: view.bvid,
+    name: stripHtml(view.title),
+    cover: view.pic,
+    description: stripHtml(view.desc),
+    artistName: view.owner?.name,
+    artistId: view.owner?.mid,
+    publishTime: view.pubdate,
+    trackCount,
+  });
+}
+
+/** 视频搜索结果 → 专辑（搜索接口不返回分 P 数，曲目数留空） */
+function toAlbumFromVideoSearch(item) {
+  if (!item?.bvid) return null;
+  return buildAlbum({
+    bvid: item.bvid,
+    name: stripHtml(item.title),
+    cover: item.pic,
+    description: stripHtml(item.description),
+    artistName: item.author,
+    artistId: item.mid,
+    publishTime: item.pubdate,
+  });
+}
+
+/** UP 主投稿列表条目 → 专辑（同样不含分 P 数） */
+function toAlbumFromVlist(v, upName, mid) {
+  if (!v?.bvid) return null;
+  return buildAlbum({
+    bvid: v.bvid,
+    name: stripHtml(v.title),
+    cover: v.pic,
+    description: stripHtml(v.description),
+    artistName: v.author || upName,
+    artistId: mid,
+    publishTime: v.created,
+  });
 }
 
 function toArtistFromBiliUser(item) {
@@ -837,14 +858,13 @@ async function fetchVideoSearch(keyword, page) {
   );
 }
 
-/** UP 主的合集列表（仅 seasons，系列视频列表不支持） */
-async function fetchSeasonList(mid, pageNum = 1, pageSize = 20) {
-  const data = await apiGet(
-    "/x/polymer/web-space/seasons_series_list",
-    { mid, page_num: pageNum, page_size: clamp(pageSize, 1, 30) },
-    { label: "获取UP主合集" },
+/** UP 主投稿列表（WBI 签名；投稿即「专辑」的来源） */
+async function fetchSpaceArchives(mid, pageNum = 1, pageSize = SPACE_PAGE_SIZE, order = "pubdate") {
+  return apiGet(
+    "/x/space/wbi/arc/search",
+    { mid, pn: pageNum, ps: clamp(pageSize, 1, 50), order, platform: "web" },
+    { wbi: true, label: "获取UP主投稿" },
   );
-  return Array.isArray(data?.items_lists?.seasons_list) ? data.items_lists.seasons_list : [];
 }
 
 /** UP 主昵称（card 接口，失败返回空串） */
@@ -878,7 +898,7 @@ async function fetchNavProfile(force = false) {
  * - 默认（type 缺省 / "song"）：视频搜索，即「单曲」。
  * - type "playlist"：B 站没有公开的歌单搜索接口，返回空（歌单=收藏夹，登录后在
  *   平台歌单里用；也可以先搜视频再进 UP 主主页）。
- * - type "album"：取视频搜索前几个 UP 主的合集，关键词过滤（无命中则原样返回）。
+ * - type "album"：视频搜索，每个稿件就是一张专辑（分 P 数留空，进详情再看）。
  * - type "artist"：bili_user 搜索（歌手 = UP 主）。
  */
 async function search(params = {}) {
@@ -888,7 +908,7 @@ async function search(params = {}) {
   }
   const type = params.type;
   if (type === "playlist") return { songs: [], playlists: [], total: 0, hasMore: false };
-  if (type === "album") return searchAlbums(keyword);
+  if (type === "album") return searchAlbums(keyword, params);
   if (type === "artist") return searchArtists(keyword, params);
   return searchSongs(keyword, params);
 }
@@ -925,50 +945,22 @@ async function searchArtists(keyword, params = {}) {
   };
 }
 
-async function searchAlbums(keyword) {
-  const data = await fetchVideoSearch(keyword, 1);
+/**
+ * 专辑搜索：直接复用视频搜索，一个稿件即一张专辑（B 站没有独立的专辑搜索接口）。
+ * 搜索结果不含分 P 数（要多打一次 view 才知道），所以 trackCount 留空，
+ * 用户点进专辑详情时再按 view.pages 展开成对应数量的分 P。
+ */
+async function searchAlbums(keyword, params = {}) {
+  const page = Math.max(1, Number(params.page) || 1);
+  const data = await fetchVideoSearch(keyword, page);
   const items = Array.isArray(data?.result) ? data.result : [];
-
-  // 取前几个 UP 主的合集当作「专辑」候选（B 站没有独立的专辑搜索接口）
-  const upNames = new Map();
-  const mids = [];
-  for (const item of items) {
-    const mid = item?.mid ? String(item.mid) : "";
-    if (!mid || upNames.has(mid)) continue;
-    upNames.set(mid, item.author || "");
-    mids.push(mid);
-    if (mids.length >= 4) break;
-  }
-
-  const lists = await Promise.all(
-    mids.map((mid) =>
-      fetchSeasonList(mid).catch((error) => {
-        debugLog(`获取 UP ${mid} 合集失败`, error);
-        return [];
-      }),
-    ),
-  );
-
-  const albums = [];
-  lists.forEach((list, index) => {
-    for (const season of list) {
-      const album = toAlbumFromSeason(season, upNames.get(mids[index]));
-      if (album) albums.push(album);
-    }
-  });
-
-  // 关键词命中优先；一条都不命中就把候选全放出来（专辑 Tab 至少有内容可看）
-  const tokens = keywordTokens(keyword);
-  const matched = tokens.length
-    ? albums.filter((album) =>
-        tokens.some((token) =>
-          `${album.name}${album.description ?? ""}`.toLowerCase().includes(token),
-        ),
-      )
-    : albums;
-  const chosen = matched.length ? matched : albums;
-  chosen.sort((a, b) => (b.trackCount ?? 0) - (a.trackCount ?? 0));
-  return { albums: chosen.slice(0, 24), total: chosen.length, hasMore: false };
+  const albums = items.map(toAlbumFromVideoSearch).filter(Boolean);
+  const numPages = Number(data?.numPages) || 0;
+  return {
+    albums,
+    total: Number(data?.numResults) || albums.length,
+    hasMore: numPages > 0 ? page < numPages : albums.length >= 20,
+  };
 }
 
 /* ------------------------------ 能力：播放直链 ------------------------------ */
@@ -1245,86 +1237,65 @@ async function getPlaylist(params = {}) {
   return { ...playlist, tracks };
 }
 
-/* ------------------------------ 能力：专辑（合集） ------------------------------ */
+/* ------------------------------ 能力：专辑（稿件） ------------------------------ */
 
-/** 合集详情：分页拉归档列表，直到拉完 / 达到 maxTracks */
+/**
+ * 专辑详情：专辑 = 一个稿件。
+ * - 无分 P 的稿件 → 专辑里只有 1 首，就是稿件本身；
+ * - 有分 P 的稿件 → 按 view.pages 展开成对应数量的分 P 曲目（`bvid#pN`）。
+ * view 一次就把 pages（cid / 分 P 标题 / 时长 / 首帧）全带回来了，不用额外请求。
+ * `maxTracks` 不作用于专辑：分 P 数由稿件本身决定，截断只会让人"少听到几首"。
+ */
 async function getAlbum(params = {}) {
-  const { mid, seasonId } = parseSeasonId(params.id);
-  const maxTracks = readNumber("maxTracks", 200, { min: 0, max: 2000 });
-  const cap = maxTracks > 0 ? maxTracks : 2000;
+  const { bvid, aid } = parseAlbumId(params.id);
+  const view = await fetchView({ bvid, aid });
 
-  let pageNum = 1;
-  let total = 0;
-  let meta = null;
-  let upName = "";
-  const archives = [];
+  const pages =
+    Array.isArray(view.pages) && view.pages.length
+      ? view.pages
+      : [{ cid: view.cid, page: 1, part: view.title, duration: view.duration }];
+  const multi = pages.length > 1;
+  const upName = view.owner?.name || "未知UP主";
+  const album = toAlbumFromView(view, pages.length);
+  const albumName = album.name;
+  const artistIds = view.owner?.mid ? [String(view.owner.mid)] : undefined;
+  debugLog(`专辑 ${album.id}：${multi ? `多 P 稿件，展开 ${pages.length} P` : "单 P 稿件，1 首"}`);
 
-  for (;;) {
-    const data = await apiGet(
-      "/x/polymer/web-space/seasons_archives_list",
-      { mid, season_id: seasonId, page_num: pageNum, page_size: SEASON_PAGE_SIZE },
-      { label: "读取合集" },
-    );
-    if (!data) throw new Error(`合集 ${seasonId} 不存在或已隐藏`);
-    if (!meta && data.meta) meta = data.meta;
-    if (typeof data.page?.total === "number") total = data.page.total;
+  const tracks = pages.map((part, index) => {
+    const pageNo = Number(part.page) || index + 1;
+    const track = {
+      id: multi ? `${view.bvid}#p${pageNo}` : view.bvid,
+      name: stripHtml(multi ? part.part || view.title : view.title) || `P${pageNo}`,
+      artists: [upName],
+      cover: httpsify(part.first_frame) || album.cover,
+      duration: parseClock(part.duration),
+      album: albumName,
+      albumId: album.id,
+      extra: { aid: view.aid, page: pageNo, cid: part.cid },
+    };
+    if (multi) track.alias = `P${pageNo}`;
+    if (artistIds) track.artistIds = artistIds;
+    return track;
+  });
 
-    const list = Array.isArray(data.archives) ? data.archives : [];
-    for (const archive of list) archives.push(archive);
-    pageNum += 1;
-
-    if (!list.length) break;
-    if (total > 0 && archives.length >= total) break;
-    if (archives.length >= cap) break;
-    if (pageNum > 67) break; // 30 * 67 ≈ 2000 条安全上限
-  }
-
-  if (!upName && meta?.mid) upName = await fetchUpName(meta.mid);
-
-  const name = meta ? cleanSeasonName(meta) : "未命名合集";
-  const album = {
-    id: `s${mid}_${seasonId}`,
-    name,
-    trackCount: total > 0 ? total : archives.length,
-    artistIds: [mid],
-    artistNames: upName ? [upName] : undefined,
-  };
-  const cover = httpsify(meta?.cover);
-  if (cover) album.cover = cover;
-  if (meta?.description) album.description = meta.description;
-  const ptime = Number(meta?.ptime || meta?.pubtime || 0);
-  if (ptime > 0) album.publishTime = Math.round(ptime * 1000);
-
-  const tracks = archives
-    .slice(0, cap)
-    .map((archive) => toTrackFromArchive(archive, { upName, mid, albumName: name, albumId: album.id }))
-    .filter(Boolean);
   return { ...album, tracks };
 }
 
 /* ------------------------------ 能力：歌手（UP 主） ------------------------------ */
 
-/** 歌手详情：card（资料）+ 最多播放投稿（热门歌曲）+ 合集列表 */
+/** 歌手详情：card（资料）+ 最多播放投稿（热门歌曲） */
 async function getArtist(params = {}) {
   const mid = String(params.id ?? "").trim();
   if (!/^\d+$/.test(mid)) throw new Error(`无法识别的歌手（UP主）ID「${params.id}」`);
 
-  const [card, hot, seasons] = await Promise.all([
+  const [card, hot] = await Promise.all([
     apiGet("/x/web-interface/card", { mid, photo: false }, { label: "获取UP主信息" }).catch((error) => {
       debugLog("card 失败", error);
       return null;
     }),
-    apiGet(
-      "/x/space/wbi/arc/search",
-      { mid, pn: 1, ps: 20, order: "click", platform: "web" },
-      { wbi: true, label: "获取UP主投稿" },
-    ).catch((error) => {
+    fetchSpaceArchives(mid, 1, 20, "click").catch((error) => {
       debugLog("投稿列表失败", error);
       return null;
-    }),
-    fetchSeasonList(mid).catch((error) => {
-      debugLog("合集列表失败", error);
-      return [];
     }),
   ]);
 
@@ -1336,46 +1307,35 @@ async function getArtist(params = {}) {
     briefDesc: card?.card?.sign || undefined,
     hotTracks: [],
   };
-  if (typeof card?.archive_count === "number") artist.songCount = card.archive_count;
-
-  // 合集名映射：给热门歌曲补上 album / albumId 跳转
-  const seasonNames = new Map();
-  for (const season of seasons) {
-    if (season?.meta?.season_id) seasonNames.set(String(season.meta.season_id), cleanSeasonName(season.meta));
+  if (typeof card?.archive_count === "number") {
+    artist.songCount = card.archive_count;
+    artist.albumCount = card.archive_count; // 专辑 = 稿件，投稿数即专辑数
   }
-  artist.albumCount = Number(seasons?.page?.total) || seasonNames.size || undefined;
 
   const vlist = Array.isArray(hot?.list?.vlist) ? hot.list.vlist : [];
-  artist.hotTracks = vlist
-    .map((v) => toTrackFromVlist(v, { upName: name, mid, seasonNames }))
-    .filter(Boolean);
+  artist.hotTracks = vlist.map((v) => toTrackFromVlist(v, { upName: name, mid })).filter(Boolean);
   return artist;
 }
 
-/** 歌手的合集分页（仅 seasons；B 站「系列」无 meta，不作为专辑暴露） */
+/** 歌手的「专辑」分页 = UP 主投稿分页（每个稿件一张专辑，点进去看分 P） */
 async function getArtistAlbums(params = {}) {
   const mid = String(params.id ?? "").trim();
   if (!/^\d+$/.test(mid)) return { albums: [], total: 0, hasMore: false };
 
   const pageNum = Math.max(1, Number(params.page) || 1);
-  const pageSize = clamp(Number(params.pageSize) || 20, 1, 30);
-  const data = await apiGet(
-    "/x/polymer/web-space/seasons_series_list",
-    { mid, page_num: pageNum, page_size: pageSize },
-    { label: "获取UP主合集" },
-  );
-  const lists = data?.items_lists ?? {};
-  const seasons = Array.isArray(lists.seasons_list) ? lists.seasons_list : [];
-  if (!seasons.length) return { albums: [], total: 0, hasMore: false };
+  const pageSize = clamp(Number(params.pageSize) || 20, 1, 50);
+  const order = String(params.order || "pubdate");
+  const data = await fetchSpaceArchives(mid, pageNum, pageSize, order);
+  const vlist = Array.isArray(data?.list?.vlist) ? data.list.vlist : [];
+  if (!vlist.length) return { albums: [], total: 0, hasMore: false };
 
-  const upName = await fetchUpName(mid);
-  const albums = seasons.map((season) => toAlbumFromSeason(season, upName)).filter(Boolean);
-  const total = Number(data?.page?.total) || 0;
+  const upName = vlist[0]?.author || (await fetchUpName(mid));
+  const albums = vlist.map((v) => toAlbumFromVlist(v, upName, mid)).filter(Boolean);
+  const total = Number(data?.page?.count) || 0;
   return {
     albums,
     total: total || albums.length,
-    // page.total 混计了系列，仅作粗略 hasMore 判断
-    hasMore: total > 0 ? pageNum * pageSize < total : seasons.length >= pageSize,
+    hasMore: total > 0 ? pageNum * pageSize < total : vlist.length >= pageSize,
   };
 }
 
