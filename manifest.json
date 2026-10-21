@@ -1,8 +1,8 @@
 {
   "id": "com.winplayer.bilibili",
   "name": "哔哩哔哩",
-  "version": "1.1.0",
-  "description": "哔哩哔哩音源。把 B 站视频当作歌曲播放：通过公开 Web 接口提供视频搜索、DASH 音频直链（64K/132K/192K）、UP 主（歌手）与视频合集（专辑）、热门推荐、字幕转歌词、热搜词、扫码登录、头像与个人收藏夹同步（收藏/取消收藏视频）。B 站没有公开的歌单搜索接口，「歌单」对应 B 站收藏夹，登录后在侧边栏「平台歌单」中使用。",
+  "version": "1.2.0",
+  "description": "哔哩哔哩音源。把 B 站视频当作歌曲播放：通过公开 Web 接口提供视频搜索、DASH 音频直链（64K/132K/192K AAC，大会员账号另有杜比全景声与 Hi-Res 无损）、UP 主（歌手）与视频合集（专辑）、热门推荐、字幕转歌词、热搜词、扫码登录、头像与个人收藏夹同步（收藏/取消收藏视频）。B 站没有公开的歌单搜索接口，「歌单」对应 B 站收藏夹，登录后在侧边栏「平台歌单」中使用。",
   "author": "WinPlayer",
   "homepage": "https://www.bilibili.com",
   "main": "main.js",
@@ -34,9 +34,11 @@
       "options": [
         { "label": "标准（64K AAC）", "value": "standard" },
         { "label": "较高（132K AAC）", "value": "higher" },
-        { "label": "高品（192K AAC）", "value": "exhigh" }
+        { "label": "高品（192K AAC）", "value": "exhigh" },
+        { "label": "杜比全景声（E-AC-3，需大会员）", "value": "dolby" },
+        { "label": "无损（Hi-Res FLAC，需大会员）", "value": "hires" }
       ],
-      "description": "B 站 DASH 音轨的三档码率；实际可用档位受稿件限制，取不到时会自动降级"
+      "description": "实际可用档位受稿件与账号权限限制：杜比 / 无损需要登录大会员账号且稿件本身支持，取不到时按档位自动回落（杜比编码为 E-AC-3，当前原生解码器暂不支持，会回落到无损 / 高品）"
     },
     {
       "key": "cookie",

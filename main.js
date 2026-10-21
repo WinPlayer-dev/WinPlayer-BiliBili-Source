@@ -8,10 +8,35 @@ const API_REFERER = "https://api.bilibili.com/";
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-/** DASH 音轨三档码率（playurl dash.audio[].id），与设置项 quality 对应 */
-const AUDIO_QUALITY_IDS = { standard: 30216, higher: 30232, exhigh: 30280 };
+/** DASH 音轨档位（playurl dash.audio[].id），与设置项 quality 对应 */
+const AUDIO_QUALITY_IDS = { standard: 30216, higher: 30232, exhigh: 30280, dolby: 30250, hires: 30251 };
 /** 音轨 id → 宿主质量标识 */
-const AUDIO_ID_LABELS = { 30216: "standard", 30232: "higher", 30280: "exhigh" };
+const AUDIO_ID_LABELS = { 30216: "standard", 30232: "higher", 30280: "exhigh", 30250: "dolby", 30251: "hires" };
+/** 音轨 id → 编码（宿主只看这份事实决定能不能播，见 SongUrlResult.codec） */
+const AUDIO_ID_CODECS = { 30250: "ec-3", 30251: "flac" };
+/**
+ * 音轨质量顺序（高 → 低）。
+ *
+ * **不能按 id 大小比质量**：杜比（30250）/ 无损（30251）的 id 反而比高品 30280 小，
+ * 用数值比较会把杜比和无损判成"低于极高"，选无损时直接漏掉 30280 这一档。
+ */
+const AUDIO_QUALITY_ORDER = [30251, 30250, 30280, 30232, 30216];
+/**
+ * DASH 请求的 fnval 位图：16=DASH、64=HDR、128=4K、256=杜比音频、512=杜比视界、
+ * 1024=8K、2048=AV1。**必须带上 256/1024**，否则响应里根本没有 dash.dolby /
+ * dash.flac 两个字段，杜比与无损永远取不到（视频清晰度位只是顺带要的，不取流）。
+ */
+const DASH_FNVAL = 4048;
+
+/**
+ * 媒体直链必需请求头。
+ *
+ * B 站 CDN（upos-sz-mirror*.bilivideo.com、cn-*-ct-*.bilivideo.com、部分第三方
+ * 边缘节点）按 Referer 防盗链：不带 Referer 一律 403，且**高码率档（30280）更容易
+ * 被分到这类节点**，所以「高音质播放失败、标准音质正常」的根因就在这里。
+ * 该头随 SongUrlResult.headers 交给宿主，原生解码器请求直链时原样带上。
+ */
+const MEDIA_HEADERS = { Referer: SITE_HOME };
 
 /** WBI mixinKey 置换表（来源：bilibili-API-collect misc/sign/wbi.md） */
 const MIXIN_KEY_ENC_TAB = [
@@ -953,23 +978,96 @@ function resolveTargetQuality(quality) {
   return AUDIO_QUALITY_IDS[key] ?? AUDIO_QUALITY_IDS.exhigh;
 }
 
-/** 选不超过目标码率的最高档；一档都没有（理论上不会）退回最低档 */
-function pickAudio(list, targetId) {
-  const usable = (Array.isArray(list) ? list : []).filter((a) => a && (a.baseUrl || a.base_url));
-  if (!usable.length) return null;
-  const sorted = [...usable].sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0));
-  return sorted.find((a) => (Number(a.id) || 0) <= targetId) ?? sorted[sorted.length - 1];
+/**
+ * 把 dash 里的音轨摊平成一条列表：常规 AAC（dash.audio）+ 杜比全景声
+ * （dash.dolby.audio，E-AC-3）+ 无损（dash.flac.audio，FLAC）。
+ *
+ * 后两者只在「稿件本身有 + 登录了大会员账号」时 audio 才非空；否则字段存在但
+ * audio 为 null（dolby.type=2 / flac.display=true 表示稿件有、当前账号无权限）。
+ * 这两条不在 dash.audio 里，必须单独收，否则永远拿不到。
+ */
+function collectAudioTracks(dash) {
+  const list = [];
+  const push = (item) => {
+    if (!item || !(item.baseUrl || item.base_url)) return;
+    const id = Number(item.id) || 0;
+    if (list.some((entry) => (Number(entry.id) || 0) === id)) return;
+    list.push(item);
+  };
+  for (const item of Array.isArray(dash?.audio) ? dash.audio : []) push(item);
+  push(dash?.dolby?.audio);
+  push(dash?.flac?.audio);
+  return list;
+}
+
+/** 杜比音轨状态（0=无，1=有，2=有但需大会员），用于日志定位「为什么没声音」 */
+function dolbyState(dash) {
+  const audio = dash?.dolby?.audio;
+  if (audio?.baseUrl || audio?.base_url) return "可用";
+  const type = Number(dash?.dolby?.type);
+  if (type === 2) return "需大会员";
+  return type === 1 ? "可用（未返回直链）" : "无";
+}
+
+/** 无损音轨状态（display=true 说明稿件有 Hi-Res，audio 为空则是权限不足） */
+function flacState(dash) {
+  const audio = dash?.flac?.audio;
+  if (audio?.baseUrl || audio?.base_url) return "可用";
+  return dash?.flac?.display ? "需大会员" : "无";
+}
+
+/** 音轨质量排名（0 = 最好）；未知 id 排在最后 */
+function audioRank(id) {
+  const index = AUDIO_QUALITY_ORDER.indexOf(Number(id));
+  return index >= 0 ? index : AUDIO_QUALITY_ORDER.length;
 }
 
 /**
- * 直链可达性探测：upos 等镜像节点有防盗链（只放行带 bilibili Referer 的请求），
- * 而 <audio> 元素只会带应用源 Referer → 403 → NotSupportedError。
- * 用 Range 0-0 探一次（无 Referer 请求的放行结论与应用源 Referer 一致：锁的都拦、不锁的都放），
- * 被拦就走 MP4 / html5 兜底线路。
+ * 候选音轨：取「质量不超过目标档位」的全部档位，最好的一条在前；一条都不剩时
+ * 退回可用里最差的一条（避免选无损却无音轨可播）。
+ *
+ * 返回整个列表而不是单条——某一档的节点可能被拒（404/410/临时故障），
+ * 逐档试比「取一档失败就跳 360P MP4」合理得多。
  */
-async function probePlayable(url) {
+function candidateAudioTracks(list, targetId) {
+  const usable = (Array.isArray(list) ? list : []).filter((a) => a && (a.baseUrl || a.base_url));
+  if (!usable.length) return [];
+  const targetRank = audioRank(targetId);
+  const within = usable
+    .filter((a) => audioRank(a.id) >= targetRank)
+    .sort((a, b) => audioRank(a.id) - audioRank(b.id) || (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0));
+  if (within.length) return within;
+  return [usable.sort((a, b) => audioRank(b.id) - audioRank(a.id))[0]];
+}
+
+/** 一条音轨的全部候选地址：主地址 + 备用地址（去重、https 化） */
+function audioCandidates(track) {
+  const raw = [
+    track?.baseUrl,
+    track?.base_url,
+    ...(Array.isArray(track?.backupUrl) ? track.backupUrl : []),
+    ...(Array.isArray(track?.backup_url) ? track.backup_url : []),
+  ];
+  const seen = new Set();
+  const out = [];
+  for (const item of raw) {
+    const url = httpsify(item);
+    if (url && !seen.has(url)) {
+      seen.add(url);
+      out.push(url);
+    }
+  }
+  return out;
+}
+
+/**
+ * 直链可达性探测：B 站 CDN 有 Referer 防盗链，因此探测**必须带上与真实播放
+ * 完全一致的请求头**（MEDIA_HEADERS），否则会得到「全部 403」的假阴性，
+ * 白白把高码率直链判死、降级到 360P MP4。
+ */
+async function probePlayable(url, headers = MEDIA_HEADERS) {
   try {
-    const response = await rawRequest({ url, headers: { Range: "bytes=0-0" } });
+    const response = await rawRequest({ url, headers: { ...headers, Range: "bytes=0-0" } });
     const host = (() => {
       try {
         return new URL(url).host;
@@ -995,8 +1093,11 @@ function durlCandidates(durl) {
 /**
  * 取播放直链：view（bvid → cid，多 P 按 #pN 取对应分 P）→ playurl 选音轨 → 探测可达性。
  * 直链约 120 分钟过期，宿主每次播放都会重新调用，不做长期缓存。
- * 防盗链处理：upos 等镜像节点只放行 bilibili Referer，浏览器里 <audio> 会 403，
- * 因此对直链先探测，被拦时自动降级 MP4 整流 / platform=html5 线路（节点不锁 Referer）。
+ *
+ * 防盗链：upos / bilivideo / 第三方边缘节点只放行带 bilibili Referer 的请求（高码率
+ * 档尤其容易被分到这类节点）。因此返回结果里必须带 `headers: MEDIA_HEADERS`，
+ * 由宿主透传给原生解码器；本函数里的探测也用同一套头，保证「探测通过 = 能播」。
+ * DASH 各档全部不可达时才降级 MP4 整流 / platform=html5 线路。
  */
 async function getSongUrl(params = {}) {
   const { bvid, aid, page } = parseTrackId(params.id);
@@ -1017,22 +1118,38 @@ async function getSongUrl(params = {}) {
   }
   debugLog(`view：aid=${view.aid} cid=${cid} 标题=${(stripHtml(view.title) || "").slice(0, 40)} 分P数=${Array.isArray(view.pages) && view.pages.length ? view.pages.length : 1}`);
 
-  const dash = await fetchPlayUrl({ bvid: view.bvid, aid: view.aid, cid, fnval: 16 });
-  const tracks = Array.isArray(dash?.dash?.audio) ? dash.dash.audio : [];
+  const dash = await fetchPlayUrl({ bvid: view.bvid, aid: view.aid, cid, fnval: DASH_FNVAL });
+  const tracks = collectAudioTracks(dash?.dash);
   debugLog(
-    `playurl(DASH)：音轨 ${tracks.length} 条 [${tracks.map((a) => `${a.id}/${a.bandwidth ?? "?"}`).join(", ")}] durl=${Array.isArray(dash?.durl) ? dash.durl.length : 0}`,
+    `playurl(DASH)：音轨 ${tracks.length} 条 [${tracks.map((a) => `${a.id}/${a.bandwidth ?? "?"}`).join(", ")}]` +
+      ` 杜比=${dolbyState(dash?.dash)} 无损=${flacState(dash?.dash)} durl=${Array.isArray(dash?.durl) ? dash.durl.length : 0}`,
   );
 
-  const audio = pickAudio(tracks, targetId);
-  let dashUrl = null;
-  if (audio) {
-    dashUrl = httpsify(audio.baseUrl || audio.base_url);
-    const reachable = await probePlayable(dashUrl);
+  const audio = candidateAudioTracks(tracks, targetId);
+  debugLog(
+    `候选音轨（目标 ${targetId}）：${audio.length ? audio.map((a) => `${a.id}/${a.bandwidth ?? "?"}`).join(", ") : "无"}`,
+  );
+  if (targetId >= AUDIO_QUALITY_IDS.dolby && !audio.some((a) => Number(a.id) === targetId)) {
     debugLog(
-      `选定音轨 id=${audio.id}（${AUDIO_ID_LABELS[Number(audio.id)] ?? "?"}）带宽=${audio.bandwidth} 探测=${reachable ? "可达" : "被拦（防盗链）"} url=${String(dashUrl).slice(0, 130)}`,
+      `目标档位 ${targetId} 不可用（杜比=${dolbyState(dash?.dash)} 无损=${flacState(dash?.dash)}），将回落到较低档位`,
     );
-    if (reachable) {
-      return { url: dashUrl, quality: AUDIO_ID_LABELS[Number(audio.id)] ?? "standard", br: audio.bandwidth };
+  }
+
+  // 首选：DASH 音轨逐档 × 主备地址逐个探测，第一个可达的即可用。
+  // 必须把 MEDIA_HEADERS 一并返回，否则原生播放器（不带 Referer）会 403。
+  let dashFallback = null; // 全部被拦时仍返回最高档，尽力而为
+  for (const track of audio) {
+    const quality = AUDIO_ID_LABELS[Number(track.id)] ?? "standard";
+    const codec = AUDIO_ID_CODECS[Number(track.id)] ?? "aac";
+    for (const url of audioCandidates(track)) {
+      if (!dashFallback) dashFallback = { url, quality, br: track.bandwidth, codec, headers: MEDIA_HEADERS };
+      const reachable = await probePlayable(url);
+      debugLog(
+        `音轨 id=${track.id}（${quality}/${codec}）带宽=${track.bandwidth} 探测=${reachable ? "可达" : "被拦（防盗链）"} url=${String(url).slice(0, 130)}`,
+      );
+      if (reachable) {
+        return { url, quality, br: track.bandwidth, codec, headers: MEDIA_HEADERS };
+      }
     }
   }
 
@@ -1046,11 +1163,11 @@ async function getSongUrl(params = {}) {
   for (const url of mp4Candidates) {
     if (await probePlayable(url)) {
       debugLog(`兜底① 可达，采用：${url.slice(0, 130)}`);
-      return { url, quality: "standard" };
+      return { url, quality: "standard", headers: MEDIA_HEADERS };
     }
   }
 
-  // 兜底②：platform=html5 移动端单文件 MP4（该线路节点不锁 Referer）
+  // 兜底②：platform=html5 移动端单文件 MP4（该线路节点通常不锁 Referer，但仍然带上头更保险）
   const html5 = await fetchPlayUrl({
     bvid: view.bvid,
     aid: view.aid,
@@ -1066,14 +1183,14 @@ async function getSongUrl(params = {}) {
   for (const url of html5Candidates) {
     if (await probePlayable(url)) {
       debugLog(`兜底② 可达，采用：${url.slice(0, 130)}`);
-      return { url, quality: "standard" };
+      return { url, quality: "standard", headers: MEDIA_HEADERS };
     }
   }
 
-  // 全部被拦：探测与浏览器环境可能有差异，仍返回 DASH 首选（尽力而为）
-  if (dashUrl) {
+  // 全部被拦：探测环境与播放环境可能有差异，仍返回 DASH 首选（尽力而为）
+  if (dashFallback) {
     debugLog("所有线路探测均失败，仍返回 DASH 直链（尽力而为，若播放失败请看上方探测日志）");
-    return { url: dashUrl, quality: AUDIO_ID_LABELS[Number(audio.id)] ?? "standard", br: audio.bandwidth };
+    return dashFallback;
   }
 
   throw new Error(
